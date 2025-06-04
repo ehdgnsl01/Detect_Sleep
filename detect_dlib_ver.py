@@ -15,19 +15,75 @@ IMG_SIZE = (34, 26)  # (width, height) for model input
 WEIGHTS_PATH = os.path.join('weights', 'classifier_weights_iter_20.pth')
 PREDICTOR_PATH = 'shape_predictor_68_face_landmarks.dat'
 
+# head down 판정 기준 (pitch 각도의 절댓값 기준)
+HEAD_PITCH_THRESHOLD = 15.0  # degree, 고개가 이만큼 아래로 숙여질 때
+HEAD_FRAME_LIMIT = 60       # 프레임 수: 60프레임(약 3초) 연속이면 졸음
+
 # -----------------------------
 # 1. 디바이스 및 모델 초기화
 # -----------------------------
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 detector = dlib.get_frontal_face_detector()
-
 predictor = dlib.shape_predictor(PREDICTOR_PATH)
 
 model = Net().to(device)
 model.load_state_dict(torch.load(WEIGHTS_PATH, map_location=device))
 model.eval()
 
-n_count = 0  # 연속 눈 감김 프레임 카운터
+n_eye_closed = 0    # 연속 눈 감김 프레임 카운터
+n_head_down = 0     # 연속 고개 숙임 프레임 카운터
+
+# Facial 3D 모델 포인트 (mm 단위 임의 값, 일반적으로 사용되는 값)
+MODEL_POINTS = np.array([
+    (0.0, 0.0, 0.0),           # Nose tip (index 30)
+    (0.0, -330.0, -65.0),      # Chin (index 8)
+    (-225.0, 170.0, -135.0),   # Left eye left corner (index 36)
+    (225.0, 170.0, -135.0),    # Right eye right corner (index 45)
+    (-150.0, -150.0, -125.0),  # Left Mouth corner (index 48)
+    (150.0, -150.0, -125.0)    # Right mouth corner (index 54)
+], dtype=np.float32)
+
+def get_head_pose(shape, size):
+    """
+    dlib shape(np.ndarray 68x2) 와 이미지 크기(size=(h, w))를 받아
+    head pose의 pitch, yaw, roll 각도를 구함.
+    """
+    image_points = np.array([
+        tuple(shape[30]),    # Nose tip
+        tuple(shape[8]),     # Chin
+        tuple(shape[36]),    # Left eye left corner
+        tuple(shape[45]),    # Right eye right corner
+        tuple(shape[48]),    # Left Mouth corner
+        tuple(shape[54])     # Right mouth corner
+    ], dtype=np.float32)
+
+    h, w = size
+    focal_length = w
+    center = (w / 2, h / 2)
+    camera_matrix = np.array([
+        [focal_length, 0, center[0]],
+        [0, focal_length, center[1]],
+        [0, 0, 1]
+    ], dtype=np.float32)
+    dist_coeffs = np.zeros((4, 1))  # 왜곡 계수: 0으로 가정
+
+    success, rotation_vector, translation_vector = cv2.solvePnP(
+        MODEL_POINTS,
+        image_points,
+        camera_matrix,
+        dist_coeffs,
+        flags=cv2.SOLVEPNP_ITERATIVE
+    )
+    if not success:
+        return 0.0, 0.0, 0.0
+
+    # rotation_vector -> rotation_matrix
+    rotation_matrix, _ = cv2.Rodrigues(rotation_vector)
+    proj_matrix = np.hstack((rotation_matrix, translation_vector))
+    _, _, _, _, _, _, euler_angles = cv2.decomposeProjectionMatrix(proj_matrix)
+    # euler_angles: [pitch, yaw, roll] in degrees
+    pitch, yaw, roll = euler_angles.flatten()
+    return pitch, yaw, roll
 
 def crop_eye(gray_img, eye_points):
     """
@@ -69,24 +125,20 @@ def predict_eye_state(eye_tensor):
     """
     with torch.no_grad():
         eye = eye_tensor.to(device)
-        outputs = model(eye)                       
+        outputs = model(eye)
         pred_tag = torch.round(torch.sigmoid(outputs))
     return pred_tag
 
 def main():
-    global n_count
+    global n_eye_closed, n_head_down
 
-    # 웹캠 열기
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         print("Webcam을 열 수 없습니다.")
         return
 
-    # 메인 윈도우 설정
     cv2.namedWindow('Drowsiness Detection', cv2.WINDOW_NORMAL)
     cv2.resizeWindow('Drowsiness Detection', 800, 600)
-
-    # 눈 창 설정
     cv2.namedWindow('Left Eye', cv2.WINDOW_NORMAL)
     cv2.resizeWindow('Left Eye', 200, 150)
     cv2.namedWindow('Right Eye', cv2.WINDOW_NORMAL)
@@ -97,9 +149,9 @@ def main():
         if not ret:
             break
 
-        # 좌우 반전 (미러) 적용
+        # 좌우 반전(미러)
         frame = cv2.flip(frame, 1)
-        # 프레임 절반 크기로 축소하여 연산 속도 개선
+        # 프레임 절반 크기로 축소
         frame = cv2.resize(frame, dsize=(0, 0), fx=0.5, fy=0.5)
 
         img = frame.copy()
@@ -107,21 +159,40 @@ def main():
 
         faces = detector(gray)
         for face in faces:
+            # 얼굴 바운딩 박스 그리기(초기에는 흰색)
+            x1, y1, x2, y2 = face.left(), face.top(), face.right(), face.bottom()
+            face_color = (255, 255, 255)
+
             shapes = predictor(gray, face)
             shapes = face_utils.shape_to_np(shapes)
 
+            # 1) Head pose 계산 (pitch, yaw, roll)
+            pitch, yaw, roll = get_head_pose(shapes, gray.shape)
+            # pitch가 threshold 이상 아래로 숙여지면 head down 카운터 증가
+            if pitch > HEAD_PITCH_THRESHOLD:
+                n_head_down += 1
+            else:
+                n_head_down = 0
+
+            # head down 상태라면 face bounding box 색 빨강으로 변경
+            if n_head_down > HEAD_FRAME_LIMIT:
+                face_color = (0, 0, 255)
+                cv2.putText(img, "Wake up (Head)", (x1, y1 - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+            # 얼굴 bounding box
+            cv2.rectangle(img, (x1, y1), (x2, y2), face_color, 2)
+
+            # --- 기존 eye detection & drowsiness logic ---
             left_eye_pts = shapes[36:42]
             right_eye_pts = shapes[42:48]
 
             eye_img_l, eye_rect_l = crop_eye(gray, left_eye_pts)
             eye_img_r, eye_rect_r = crop_eye(gray, right_eye_pts)
 
-            # 리사이즈 및 전처리
             eye_img_l = cv2.resize(eye_img_l, IMG_SIZE)
             eye_img_r = cv2.resize(eye_img_r, IMG_SIZE)
             eye_img_r = cv2.flip(eye_img_r, 1)
 
-            # NumPy → Tensor: (H,W) → (1,H,W,1) → permute → (1,1,H,W)
             eye_np_l = eye_img_l.reshape((1, IMG_SIZE[1], IMG_SIZE[0], 1)).astype(np.float32)
             eye_np_r = eye_img_r.reshape((1, IMG_SIZE[1], IMG_SIZE[0], 1)).astype(np.float32)
             eye_tensor_l = torch.from_numpy(eye_np_l).permute(0, 3, 1, 2)
@@ -132,56 +203,42 @@ def main():
 
             # 연속 눈 감김 카운터
             if pred_l.item() == 0.0 and pred_r.item() == 0.0:
-                n_count += 1
+                n_eye_closed += 1
             else:
-                n_count = 0
+                n_eye_closed = 0
 
-            # n_count가 100 프레임 이상이면 "Wake up" 메시지
-            if n_count > 100:
-                cv2.putText(img, "Wake up", (120, 160),
+            # 눈 감김 기준으로 졸음 판단
+            if n_eye_closed > 100:
+                cv2.putText(img, "Wake up (Eye)", (x1, y2 + 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
 
-            # 상태 텍스트
+            # 눈 사각형 & 상태 표시
             state_l = 'Open' if pred_l.item() == 1 else 'Closed'
             state_r = 'Open' if pred_r.item() == 1 else 'Closed'
 
-            # 메인 창에 눈 사각형 & 상태 표시
-            cv2.rectangle(img, (eye_rect_l[0], eye_rect_l[1]), (eye_rect_l[2], eye_rect_l[3]), (255, 255, 255), 1)
-            cv2.rectangle(img, (eye_rect_r[0], eye_rect_r[1]), (eye_rect_r[2], eye_rect_r[3]), (255, 255, 255), 1)
+            cv2.rectangle(img, (eye_rect_l[0], eye_rect_l[1]),
+                          (eye_rect_l[2], eye_rect_l[3]), (255, 255, 255), 1)
+            cv2.rectangle(img, (eye_rect_r[0], eye_rect_r[1]),
+                          (eye_rect_r[2], eye_rect_r[3]), (255, 255, 255), 1)
             cv2.putText(img, state_l, (eye_rect_l[0], eye_rect_l[1] - 5),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
             cv2.putText(img, state_r, (eye_rect_r[0], eye_rect_r[1] - 5),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
 
-            # 각 눈 창에 텍스트 오버레이하여 보여주기 (리사이즈 후 텍스트)
-            # 왼쪽 눈 창
+            # 작은 창: 확대된 눈 이미지 + 상태 표시
             eye_small_l = cv2.resize(eye_img_l, (200, 150), interpolation=cv2.INTER_NEAREST)
             eye_small_l = cv2.cvtColor(eye_small_l, cv2.COLOR_GRAY2BGR)
-            cv2.putText(
-                eye_small_l,
-                state_l,            # "Open" 또는 "Closed"
-                (5, 15),            # 창 왼쪽 위(5,15)
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,                # 폰트 크기(작게)
-                (0, 255, 0) if pred_l.item() == 1 else (0, 0, 255),  # 색깔
-                1                   # 두께
-            )
+            cv2.putText(eye_small_l, state_l, (5, 15),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                        (0, 255, 0) if pred_l.item() == 1 else (0, 0, 255), 1)
             cv2.imshow('Left Eye', eye_small_l)
 
-            # 오른쪽 눈 창
             eye_small_r = cv2.resize(eye_img_r, (200, 150), interpolation=cv2.INTER_NEAREST)
             eye_small_r = cv2.cvtColor(eye_small_r, cv2.COLOR_GRAY2BGR)
-            cv2.putText(
-                eye_small_r,
-                state_r,            # "Open" 또는 "Closed"
-                (5, 15),            # 창 왼쪽 위(5,15)
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,                # 폰트 크기(작게)
-                (0, 255, 0) if pred_r.item() == 1 else (0, 0, 255),
-                1
-            )
+            cv2.putText(eye_small_r, state_r, (5, 15),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                        (0, 255, 0) if pred_r.item() == 1 else (0, 0, 255), 1)
             cv2.imshow('Right Eye', eye_small_r)
-
 
         # 메인 창 표시
         cv2.imshow('Drowsiness Detection', img)
