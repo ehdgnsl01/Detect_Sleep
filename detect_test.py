@@ -3,6 +3,7 @@ import cv2
 import dlib
 import numpy as np
 import torch
+import time
 from imutils import face_utils
 from model import Net
 
@@ -13,14 +14,18 @@ IMG_SIZE = (34, 26)  # 모델 입력용 눈 크기 (width, height)
 WEIGHTS_PATH = os.path.join('weights', 'classifier_weights_iter_20.pth')
 PREDICTOR_PATH = 'shape_predictor_68_face_landmarks.dat'
 FACE_CASCADE_PATH = 'data/haarcascade_frontalface_alt.xml'  # Haar Cascade 경로
-VIDEO_PATH = 'data/video2.avi'  # 저장된 영상 경로 (없으면 웹캠 사용)
+VIDEO_PATH = 'data/video2.mp4'  # 저장된 영상 경로 (없으면 웹캠 사용)
 
 # 눈 감김 연속 판단 임계
 EYE_CLOSED_FRAME_THRESHOLD = 30
+# 90프레임 이상 지속 시 SLEEP WARNING
+EYE_WARNING_FRAME_THRESHOLD = 90
+
 # 고개 정면이 아닐 때 판정 기준(사용하지 않음, 오직 pitch 표시용)
-HEAD_PITCH_DOWN_THRESHOLD = 170
-HEAD_PITCH_UP_THRESHOLD = -165
+HEAD_PITCH_DOWN_THRESHOLD = -10
+HEAD_PITCH_UP_THRESHOLD = 7
 HEAD_OFF_FRAME_THRESHOLD = 30
+HEAD_WARNING_FRAME_THRESHOLD = 90
 
 # -----------------------------
 # 1. 모델 및 검출기 초기화
@@ -48,22 +53,18 @@ n_head_off = 0
 
 # Facial 3D 모델 포인트 (mm 단위)
 MODEL_POINTS = np.array([
-    (0.0, 0.0, 0.0),           # 코끝 (index 30)
-    (0.0, -330.0, -65.0),      # 턱 (index 8)
-    (-225.0, 170.0, -135.0),   # 왼쪽 눈 왼쪽 모서리 (36)
-    (225.0, 170.0, -135.0),    # 오른쪽 눈 오른쪽 모서리 (45)
-    (-150.0, -150.0, -125.0),  # 왼쪽 입 모서리 (48)
-    (150.0, -150.0, -125.0)    # 오른쪽 입 모서리 (54)
+    (0.0,    0.0,   0.0),     # 코끝 (index 30)
+    (0.0,  -330.0, -65.0),    # 턱 (index 8)
+    (-225.0, 170.0, -135.0),  # 왼쪽 눈 왼쪽 모서리 (36)
+    (225.0,  170.0, -135.0),  # 오른쪽 눈 오른쪽 모서리 (45)
+    (-150.0, -150.0, -125.0), # 왼쪽 입 모서리 (48)
+    (150.0,  -150.0, -125.0)  # 오른쪽 입 모서리 (54)
 ], dtype=np.float32)
 
 # -----------------------------
 # 2. 헬퍼 함수들
 # -----------------------------
 def get_head_pose(shape, img_shape):
-    """
-    dlib 68개 랜드마크(shape)와 그레이 이미지 크기(img_shape=(h,w))를 받아
-    head pose의 pitch, yaw, roll을 반환 (degree 단위)
-    """
     image_points = np.array([
         tuple(shape[30]),  # 코끝
         tuple(shape[8]),   # 턱
@@ -100,15 +101,6 @@ def get_head_pose(shape, img_shape):
     return pitch, yaw, roll
 
 def crop_eye(gray_img, eye_points):
-    """
-    눈 랜드마크 6개(eye_points)로부터 눈 영역 크롭
-    Args:
-        gray_img: 그레이스케일 전체 프레임
-        eye_points: (6,2) 눈 랜드마크 좌표
-    Returns:
-        eye_img: 크롭한 눈 이미지 (uint8)
-        eye_rect: [min_x, min_y, max_x, max_y]
-    """
     x1, y1 = np.amin(eye_points, axis=0)
     x2, y2 = np.amax(eye_points, axis=0)
     cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
@@ -129,14 +121,9 @@ def crop_eye(gray_img, eye_points):
 
     eye_rect = [min_x, min_y, max_x, max_y]
     eye_img = gray_img[min_y:max_y, min_x:max_x]
-
     return eye_img, eye_rect
 
 def predict_eye_state(eye_tensor):
-    """
-    eye_tensor: torch.Tensor, shape (1,1,26,34)
-    Returns: 0=Closed, 1=Open
-    """
     with torch.no_grad():
         eye = eye_tensor.to(device)
         outputs = model(eye)
@@ -199,10 +186,16 @@ def main():
             shapes = face_utils.shape_to_np(shapes)
 
             # 1) Head pose 계산 (pitch 값 저장)
-            pitch, yaw, roll = get_head_pose(shapes, gray.shape)
+            pitch_raw, yaw, roll = get_head_pose(shapes, gray.shape)
+            if pitch_raw > 90:
+                pitch = pitch_raw - 180
+            elif pitch_raw < -90:
+                pitch = pitch_raw + 180
+            else:
+                pitch = pitch_raw
             current_pitch = pitch  # 가장 마지막 얼굴의 pitch이지만, 얼굴이 하나만 있다고 가정
             # 정면 기준: -15 ≤ pitch ≤ +15, 아닐 경우 n_head_off 카운터 증가
-            if pitch > HEAD_PITCH_DOWN_THRESHOLD or pitch < HEAD_PITCH_UP_THRESHOLD:
+            if pitch < HEAD_PITCH_DOWN_THRESHOLD or pitch > HEAD_PITCH_UP_THRESHOLD:
                 any_head_off_this_frame = True
 
             # 2) 눈 감김 판단
@@ -273,17 +266,35 @@ def main():
         else:
             n_head_off = 0
 
-        # 눈 감김 졸음 판정: 왼쪽 상단에 메시지
-        if n_eye_closed > EYE_CLOSED_FRAME_THRESHOLD:
-            cv2.putText(img, "Wake up (Eye)", (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-
-        # 고개 pitch 값을 오른쪽 상단에 실시간 표시
         h, w = img.shape[:2]
+
+        # “눈이나 고개”가 30프레임 초과 시
+        if n_eye_closed > EYE_CLOSED_FRAME_THRESHOLD or n_head_off > HEAD_OFF_FRAME_THRESHOLD:
+            # “눈이나 고개”가 90프레임 초과 시 → 중앙 “SLEEP WARNING” + 깜빡이는 빨간 테두리
+            if n_eye_closed > EYE_WARNING_FRAME_THRESHOLD or n_head_off > EYE_WARNING_FRAME_THRESHOLD:
+                # 중앙 텍스트
+                warning_text = "SLEEP WARNING"
+                txt_size = cv2.getTextSize(warning_text, cv2.FONT_HERSHEY_SIMPLEX, 1.5, 3)[0]
+                x_txt = (w - txt_size[0]) // 2
+                y_txt = (h + txt_size[1]) // 2
+                cv2.putText(img, warning_text, (x_txt, y_txt),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 3)
+
+                # 깜빡이는 테두리: 0.5초 간격으로 토글
+                if int(time.time() * 2) % 2 == 0:
+                    thickness = 8
+                    color = (0, 0, 255)
+                    cv2.rectangle(img, (0, 0), (w - 1, h - 1), color, thickness)
+            else:
+                # 30프레임 초과이지만 90프레임 이하는 → “Wake up” 메시지
+                cv2.putText(img, "Wake up", (10, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+
+        # 보정된 pitch를 오른쪽 상단(메시지 바로 아래)에 실시간 표시
         pitch_text = f"Pitch: {current_pitch:.1f}"
-        text_size = cv2.getTextSize(pitch_text, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)[0]
-        x_text = w - text_size[0] - 10
-        cv2.putText(img, pitch_text, (x_text, 30),
+        txt_sz = cv2.getTextSize(pitch_text, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)[0]
+        x_txt2 = w - txt_sz[0] - 10
+        cv2.putText(img, pitch_text, (x_txt2, 60),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
 
         # 결과 창 표시
